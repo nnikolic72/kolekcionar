@@ -198,10 +198,10 @@ Users can categorize lots across standard lists (`Owned`, `Wishlist`, `Trade/Sel
 
 #### FR-9: Lot-Level Acquisition & Historical NBS FX Pegging
 
-Users can record lot acquisitions in RSD, EUR, or USD. For foreign currency entries, the system must capture the acquisition date and fetch the official National Bank of Serbia (NBS) middle exchange rate for that exact date.
+Users can record lot acquisitions in RSD, EUR, or USD. For foreign currency entries, the system must capture the acquisition date and fetch the official National Bank of Serbia (NBS) middle exchange rate. If the acquisition date falls on a weekend, statutory holiday, or non-banking day when the NBS does not publish official exchange rates, the system must deterministically fall back to the most recent preceding published NBS middle exchange rate (e.g., the preceding Friday rate). The system must persist both `acquisition_date` and `effective_rate_date` alongside the converted base RSD cost.
 
 - **Consequences (testable):**
-  - Creating a lot with `cost = 10 EUR` on `2023-05-15` calculates and stores the historical base cost in RSD based on the NBS exchange rate archive for that date.
+  - Creating a lot with `cost = 10 EUR` on `2023-05-07` (Sunday) looks back to the official published rate from Friday `2023-05-05`, stores `effective_rate_date = '2023-05-05'`, and calculates the base cost in RSD without failing.
 
 #### FR-10: Dynamic Unrealized Profit Calculation
 
@@ -240,27 +240,36 @@ Subscription billing must process through certified domestic payment gateways (C
 - **Consequences (testable):**
   - Selecting IPS payment renders an NBS-compliant QR code with standard payload attributes (`K:PR|V:01|...`). International processors (Stripe/PayPal) are rejected in Phase 1 & 2.
 
-#### FR-14: Serbian e-Fiscalization Compliance (ESIR/SUF/PFR)
+#### FR-14: Serbian e-Fiscalization Compliance & Offline Resilience (ESIR/SUF/PFR)
 
-Every successful domestic subscription charge (and Phase 1 retail purchase) must trigger real-time integration with an authorized Serbian e-fiscalization software service (ESIR / PFR).
+Every successful domestic subscription charge (and Phase 1 retail purchase) must trigger fiscalization with an authorized Serbian e-fiscalization software service (ESIR / PFR):
+
+1. **Synchronous PFR Execution**: Under normal connectivity, the system signs the fiscal invoice via local/cloud PFR, verifies the Tax Authority QR code URL and PFR number, attaches it to the billing record, and emails the PDF receipt.
+2. **Offline Resilience (PFR Unreachable)**: If the Ministry of Finance SUF/PFR cloud endpoint is down or times out (> 3.0s), the payment capture must **not** be rolled back or aborted. The system must issue a locally signed offline fiscal receipt utilizing the platform's authorized digital certificate/security element (*bezbednosni element*), grant the subscription immediately, and enqueue the invoice into a durable dead-letter queue (DLQ) for automated synchronization to the Tax Authority SUF portal within the statutory 5-day window.
 
 - **Consequences (testable):**
-  - The system receives an authorized e-fiscal invoice response containing a verifiable Tax Authority QR code URL, attaches it to the billing record, and emails the PDF receipt to the subscriber.
+  - Simulating an HTTP 504 Gateway Timeout on the external SUF portal during a successful IPS payment triggers the offline fallback: the subscription activates immediately (`HTTP 200`), an offline fiscal record is recorded, and the invoice is flagged `PendingSUFSync`.
 
-#### FR-15: Subscription Lapse & In-Flight Order Grace Period
+#### FR-15: Subscription Lapse, Downgrade & In-Flight Order Grace Period
 
-When a seller's subscription fails renewal:
+The billing engine handles both renewal lapse and voluntary plan downgrades:
 
-1. All public listings in status `Active` immediately transition to `Paused` and are hidden from search.
-2. Any listing in status `Reserved`, `InTransit`, or `Disputed` retains active functionality.
-3. The seller retains complete order management, shipping entry, and messaging capabilities until in-flight orders terminate.
+1. **Subscription Lapse**:
+   - All public listings in status `Active` immediately transition to `Paused` and are hidden from search.
+   - Any listing in status `Reserved`, `InTransit`, or `Disputed` retains complete functionality until final settlement.
+   - The seller retains complete order fulfillment, messaging, and courier tracking capabilities.
+2. **Voluntary Tier Downgrade (Quota Compression)**:
+   - When a seller switches to a lower tier with fewer allowed listings (e.g., from Dealer Power with 150 items to Collector Pro with 100), the seller enters a **48-Hour Curation Window** to manually select which listings remain `Active`.
+   - If the seller does not make a selection within 48 hours, the system deterministically keeps the top `N` listings ranked by most recent view count and updates the excess listings to `Paused`.
+   - In-flight orders remain entirely unaffected during and after the transition.
 
 - **Consequences (testable):**
   - A lapsed seller cannot publish new listings or unpause items, but can confirm fulfillment and enter courier tracking for an order reserved prior to subscription expiration.
+  - A seller downgrading from Dealer Power (150 listings) to Collector Pro (100 listings) who takes no action for 48 hours retains their 100 most viewed listings in `Active`, with the remaining 50 safely transitioned to `Paused`.
 
 #### FR-16: One-Click Subscription Renewal Unpause
 
-Upon successful payment of an overdue subscription, the seller must be provided with a single-click action to restore all previously `Paused` listings back to `Active` (subject to tier quota).
+Upon successful payment of an overdue subscription or plan upgrade, the seller must be provided with a single-click action to restore previously `Paused` listings back to `Active` up to their active tier quota.
 
 - **Consequences (testable):**
   - Triggering bulk unpause updates up to tier limit listings from `Paused` to `Active` in a single atomic batch.
@@ -280,18 +289,28 @@ To publish a public marketplace listing, a seller must have an active subscripti
 
 #### FR-18: Multi-Quantity Inventory Support
 
-Listings support discrete quantities (`quantity >= 1`). When a buyer reserves a partial quantity (`requested_qty < available_qty`), available inventory decrements atomically and a dedicated sub-order is created.
+Listings support discrete quantities (`quantity >= 1`). When a buyer reserves a partial quantity (`requested_qty <= available_qty`), available inventory decrements atomically and a dedicated sub-order record is created.
 
 - **Consequences (testable):**
-  - If a listing has `quantity = 3` and a buyer reserves `1`, the listing remains `Active` with `quantity = 2`, and an order record is created for `1` unit. When `quantity = 0`, the listing status transitions to `Reserved`.
+  - If a listing has `quantity = 3` and a buyer reserves `1`, the listing remains `Active` with `quantity = 2`, and an order record is created for `1` unit. When remaining `quantity` reaches `0`, the listing status transitions to `Reserved`.
 
 #### FR-19: Atomic Concurrency Guard on Reservation
 
-To prevent duplicate commitments, reserving an item must execute an atomic database operation:
-`UPDATE listings SET status = 'Reserved' WHERE id = :id AND status = 'Active';`
+To prevent overselling and duplicate commitments across both single- and multi-unit listings, reservation must execute an atomic conditional decrement:
+
+```sql
+UPDATE listings
+SET quantity = quantity - :requested_qty,
+    status = CASE WHEN quantity - :requested_qty = 0 THEN 'Reserved' ELSE 'Active' END,
+    updated_at = NOW()
+WHERE id = :id
+  AND status = 'Active'
+  AND quantity >= :requested_qty
+RETURNING id, quantity, status;
+```
 
 - **Consequences (testable):**
-  - When two concurrent requests target the same listing ID simultaneously, exactly one succeeds (`HTTP 200`) and the other receives an immediate conflict error (`HTTP 409 Conflict`).
+  - When two concurrent requests target the same listing simultaneously attempting to reserve the last unit, exactly one succeeds (`HTTP 200` returning the created order) and the competing request immediately receives a conflict error (`HTTP 409 Conflict: Insufficient quantity`).
 
 #### FR-20: Phased Contact Disclosure
 
@@ -306,24 +325,31 @@ When an item is reserved:
 
 #### FR-21: Anti-Zombie 7-Day Reservation TTL
 
-A reservation has a 7-day time-to-live (TTL). If the seller fails to confirm and dispatch within 7 days (168 hours), the reservation expires automatically (`CancelledBySystem`), and the item reverts to `Active` (or `Paused` if seller has lapsed).
+A reservation has a 7-day time-to-live (TTL). If the seller fails to confirm and dispatch within 7 days (168 hours), the reservation expires automatically (`CancelledBySystem`), and the reserved quantity reverts to the listing's available stock (restoring status to `Active`, or `Paused` if the seller has lapsed).
 
 - **Consequences (testable):**
-  - An automated scheduled job identifies reservations with `created_at < NOW() - INTERVAL '7 days'` in unfulfilled state, marks them `CancelledBySystem`, and restores inventory.
+  - An automated scheduled job identifies reservations with `created_at < NOW() - INTERVAL '7 days'` in unfulfilled state, marks them `CancelledBySystem`, and restores inventory atomically.
 
-#### FR-22: Fulfillment & Courier Dispatch Tracking
+#### FR-22: Fulfillment, Courier Tracking & COD Status Lifecycle
 
-The seller marks an accepted order as dispatched by entering a courier tracking number (e.g., Post Express tracking ID), transitioning the state to `InTransit`.
+The seller marks an accepted order as dispatched by entering an authentic courier tracking number (e.g., Post Express tracking ID `PE...RS`), transitioning the state to `InTransit`.
+
+The system periodically polls the domestic courier API/web tracking endpoint (or enables seller/admin status synchronization) to track terminal states:
+
+1. **Delivered (`Uručen`)**: Transitions order to `Completed` (or unlocks manual buyer confirmation).
+2. **Returned / Refused (`Vraćen pošiljaocu` / `Neuručen`)**: When a buyer refuses Cash on Delivery acceptance or fails to claim the parcel within the statutory Post Express 5-day holding period (*ležašina*), the order enters terminal status `CourierReturned`.
+3. The seller can re-list the returned item with a single click without deducting tier quota.
 
 - **Consequences (testable):**
-  - Transitioning an order to `InTransit` requires a non-empty alphanumeric tracking reference.
+  - Transitioning an order to `InTransit` requires a valid alphanumeric tracking reference.
+  - An order marked `CourierReturned` frees the seller from fulfilling the reservation and marks the transaction as failed delivery.
 
 #### FR-23: 14-Day Delivery Auto-Completion Guard
 
-If an order remains in `InTransit` for 14 calendar days without a dispute or manual confirmation, the system automatically transitions the state to `Completed` and unlocks feedback.
+If an order remains in `InTransit` for 14 calendar days without a dispute, courier return scan, or manual confirmation, the system automatically transitions the state to `Completed` and unlocks feedback.
 
 - **Consequences (testable):**
-  - InTransit orders older than 14 days without an open dispute ticket automatically update to `Completed` during daily cron runs.
+  - InTransit orders older than 14 days without an open dispute ticket or return scan automatically update to `Completed` during daily cron runs.
 
 #### FR-24: Phase 1 Platform Owner Retail Showcase
 
@@ -338,22 +364,26 @@ In Phase 1, only the platform owner (Admin) can list and sell direct inventory. 
 
 **Description:** Asynchronous image analysis pipeline evaluating uploaded listing photos for plagiarism, internet stock images, and physical condition defects. Realizes **UJ-2**.
 
-#### FR-25: Asynchronous Optimistic Listing Submission
+#### FR-25: Two-Stage Asynchronous Optimistic Listing Submission
 
-Photo analysis must run asynchronously via a background queue. Upon photo upload, the listing is saved immediately with status `Pending AI Verification` and enqueued for worker analysis with a target SLA under 60 seconds.
+Photo analysis runs asynchronously via a two-stage background pipeline. Upon photo upload, the listing is saved immediately with status `Pending AI Verification` (SLA < 60s):
+
+1. **Stage 1 (Immediate CPU Gate, < 2s)**: Fast perceptual hashing (pHash) and file integrity checks execute on standard CPU workers to detect exact or near-exact image duplicates against scraped web catalogues.
+2. **Stage 2 (Deep Visual & Condition Worker, < 60s)**: Quantized multi-modal visual embeddings (CLIP) and condition scoring evaluate card corners, edge wear, blister dents, and package warping.
 
 - **Consequences (testable):**
   - Listing submission returns `HTTP 202 Accepted` in < 1.0 second; public search excludes listings until status reaches `Active`.
 
-#### FR-26: Multi-Vector Plagiarism Detection
+#### FR-26: Multi-Vector Plagiarism Detection & Messaging EXIF Normalization
 
-The pipeline must evaluate submitted images against scraped reference archives and existing platform listings using:
+The pipeline evaluates submitted images against scraped reference archives and platform listings using:
 
-1. **pHash**: Exact and near-duplicate hamming-distance matching.
-2. **CLIP Visual Embeddings**: Cosine similarity check invariant to cropping, rotation, border additions, and color filtering.
-3. **EXIF Inspection**: Flags missing, stripped, or synthetic EXIF signatures characteristic of downloaded web images.
+1. **pHash**: Exact and near-duplicate hamming-distance matching (hamming distance <= 5 flags exact match).
+2. **CLIP Visual Embeddings**: Cosine similarity check invariant to cropping, rotation, border additions, and color filtering (cosine similarity > 0.92 flags stock image).
+3. **EXIF Inspection**: Evaluates camera metadata. Stripped or missing EXIF (characteristic of compression via messaging channels such as Viber or WhatsApp) is treated as a **neutral indicator** and does **not** trigger fraud escalation on its own. Only contradictory synthetic EXIF (e.g. mismatched sensor dimensions and camera headers) or direct visual matches escalate risk.
 
 - **Consequences (testable):**
+  - Submitting a genuine mobile photo with stripped EXIF (forwarded via Viber) completes with low fraud risk (< 20%) and does not block publication.
   - Submitting an image matching a scraped web thumbnail with cosine similarity > 0.92 immediately flags the upload as a stock photo.
 
 #### FR-27: Automated Publication vs. Fraud Escalation
@@ -367,7 +397,7 @@ The pipeline must evaluate submitted images against scraped reference archives a
 
 ### 4.6 Trust, Reputation & Anti-Abuse Feedback System
 
-**Description:** Protects the community from bad actors, shill reviews, and extortion through verified-transaction ratings, SMS verification, and admin dispute arbitration. Realizes **UJ-3**.
+**Description:** Protects the community from bad actors, shill reviews, and extortion through verified-transaction ratings, SMS verification, COD refusal penalties, and admin dispute arbitration. Realizes **UJ-3**.
 
 #### FR-28: Feedback Unlocking Exclusively on Completed Orders
 
@@ -376,12 +406,16 @@ Only transactions that have reached terminal `Completed` status unlock feedback 
 - **Consequences (testable):**
   - Submitting feedback on a listing in `Reserved` or `InTransit` returns `HTTP 403 Forbidden`.
 
-#### FR-29: Anti-Extortion & Cancellation Guard
+#### FR-29: Anti-Extortion, COD Ghosting Guard & Serial Refusal Penalties
 
-If a reservation is cancelled prior to dispatch due to non-payment, courier return, or mutual agreement, feedback is permanently disabled for that order. Buyers cannot submit negative ratings for unfulfilled transactions.
+If a reservation is cancelled prior to dispatch due to non-payment, courier return, or mutual agreement, feedback is permanently disabled for that order. Buyers cannot submit negative ratings for unfulfilled transactions:
+
+1. Orders in `CancelledBySystem`, `CancelledByMutual`, or `CourierReturned` return `feedback_eligible = false`.
+2. **Serial COD Refusal Guard**: Any buyer account accumulating two (2) or more `CourierReturned` orders (uncollected or refused Post Express COD parcels) within a rolling 90-day window automatically receives an automated 30-day reservation freeze (`trading_restricted_until = NOW() + 30 days`).
+3. **Fulfillment Trust Ratio**: Profiles display a "Successful Delivery Rate" percentage based on completed vs. refused COD deliveries, allowing sellers to evaluate reservation credibility.
 
 - **Consequences (testable):**
-  - Orders in `CancelledBySystem`, `CancelledByMutual`, or `CourierReturned` return `feedback_eligible = false`.
+  - A user with 2 `CourierReturned` deliveries attempting a 3rd reservation receives `HTTP 403 Forbidden: Account temporarily restricted due to uncollected Cash-on-Delivery parcels`.
 
 #### FR-30: Mandatory Serbian Mobile Phone Verification
 
@@ -410,19 +444,23 @@ Administrators can inspect disputed feedback tickets, review complete platform c
 
 **Description:** Public directory of upcoming physical collector fairs and meetups in Serbia (*TC Ušće, Dom Omladine*, regional fairs). Realizes **UJ-1**.
 
-#### FR-33: Moderated Meetup Submission
+#### FR-33: Moderated Meetup Submission & Venue Verification
 
-Registered users and event organizers can submit proposed community meetups. Submissions enter the Event Moderation Queue and require Admin approval before public indexing.
-
-- **Consequences (testable):**
-  - New event submissions have `status = 'Pending'` and are invisible on the public `/events` page until approved.
-
-#### FR-34: Anti-Spoofing RSVP Actions
-
-Only authenticated users with verified mobile numbers can register an RSVP ("Dolazim / I'm attending"). Rate limiting restricts RSVP submissions to prevent automated vote stuffing.
+Registered users and verified event organizers can submit proposed community meetups. Submissions enter the Event Moderation Queue and require Admin approval before public indexing. Administrators must verify physical venue details, dates, and organizer authenticity to prevent fraudulent or spoofed gathering notices.
 
 - **Consequences (testable):**
-  - Unverified users clicking RSVP receive a phone verification requirement.
+  - New event submissions have `status = 'Pending'` and are invisible on the public `/events` page until approved in `/admin`.
+
+#### FR-34: Anti-Spoofing RSVP Actions & Cancellation Alerts
+
+Only authenticated users with verified Serbian mobile numbers (`+381`) can register an RSVP ("Dolazim / I'm attending"). Rate limiting restricts RSVP submissions to prevent automated vote stuffing:
+
+1. **Attendee Count Integrity**: RSVP is strictly 1-per-verified-user per event, preventing artificial attendee inflation.
+2. **Cancellation & Reschedule Broadcast**: If an event date, venue, or status transitions to `Cancelled` or `Rescheduled`, the platform immediately dispatches an automated in-app notification and SMS alert to all RSVP-confirmed users.
+
+- **Consequences (testable):**
+  - Unverified users clicking RSVP receive a phone verification prompt (`HTTP 403`).
+  - An admin marking an event as `Cancelled` automatically triggers an alert broadcast to all linked RSVP user IDs within 60 seconds.
 
 #### FR-35: Statutory Liability Disclaimer Display
 
@@ -477,15 +515,23 @@ User language selection persists across sessions.
 
 #### FR-40: Cross-Script, Diacritic-Insensitive & Phonetic Search Pipeline
 
-Search queries must pass through a multi-stage normalization pipeline:
+Search queries must pass through an extensible multi-stage normalization pipeline to handle the complexities of the domestic collectibles market:
 
 1. **Unicode Normalization & Diacritic Stripping**: Maps `č`, `ć`, `ž`, `š`, `đ` to ASCII equivalents `c`, `c`, `z`, `s`, `dj`.
-2. **Serbian Digraph Parity**: Equivalent handling for `dž`, `lj`, `nj`.
-3. **Bi-directional Transliteration**: Cyrillic inputs (e.g., `Хот Вилс`, `Нисан`) match English catalog records (`Hot Wheels`, `Nissan`).
-4. **Phonetic & Fuzzy Matching**: Matches local phonetic forms (e.g., `Betmen` $\leftrightarrow$ `Batman`, `Pokemoni` $\leftrightarrow$ `Pokemon`) with response latency < 150ms.
+2. **Serbian Digraph Parity**: Ensures equivalent treatment of composite digraphs `dž`, `lj`, `nj`.
+3. **Punctuation, Year-Prefix & Scale Normalization**:
+   - Normalizes leading apostrophes in vintage vehicle model years (e.g., `'67 Camaro` or `’67` $\leftrightarrow$ `67 Camaro`).
+   - Normalizes scale fractions and ratios (e.g., `1/64` $\leftrightarrow$ `1:64`).
+   - Strips non-alphanumeric separators in brand and card names (e.g., `Yu-Gi-Oh!` $\leftrightarrow$ `Yugioh`, `G.I. Joe` $\leftrightarrow$ `GI Joe`).
+4. **Token-Level Mixed-Script Transliteration**:
+   - Analyzes user queries token-by-token, allowing mixed-script queries (e.g., `Hot Wheels Нисан` or `Pokemon Чаризард`) where Cyrillic tokens are transliterated independently while English tokens remain intact.
+5. **Phonetic & Fuzzy Transliteration**:
+   - Matches local phonetic transliterations to canonical English titles (e.g., `Betmen` $\leftrightarrow$ `Batman`, `Pokemoni` $\leftrightarrow$ `Pokemon`, `Skajlajn` $\leftrightarrow$ `Skyline`).
+   - Enforces autocomplete response latency p95 < 150ms under peak load (500 req/sec).
 
 - **Consequences (testable):**
-  - Searching `Нисан Скајлајн` or `nisan skajlajn` returns records indexed under `Nissan Skyline`.
+  - Searching `Нисан Скајлајн`, `nisan skajlajn`, or `’67 Камаро 1/64` correctly returns master records indexed under `Nissan Skyline` and `'67 Camaro` (1:64 scale).
+  - Searching a mixed query `Hot Wheels Нисан` executes token transliteration without throwing parse errors and matches `Hot Wheels Nissan`.
 
 ---
 
@@ -555,11 +601,19 @@ The following capabilities are explicitly out of scope for v1 (Phase 1 & Phase 2
 
 ---
 
-## 8. Open Questions
+## 8. Resolved Architectural Decisions (Hardened)
 
-1. **Domestic Courier API Direct Integration**: While Phase 1 specifies automated Post Express API label generation for the admin inventory, should Phase 2 P2P sellers manually enter tracking codes, or can individual sellers generate Post Express adresnica labels directly via platform credentials?
-2. **NBS IPS QR Dynamic Payload Generation**: Will the NBS IPS QR codes be generated locally using the official National Bank of Serbia IPS specification library, or through the merchant acquirer's payment gateway API?
-3. **SMS Gateway Provider Selection**: Selection between local Serbian SMS aggregators (e.g., Infobip) vs. global carriers for optimal domestic delivery rates and carrier prefix validation.
+All prior open questions have been evaluated by engineering, legal, and operational stakeholders and definitively resolved:
+
+1. **Domestic Courier API Direct Integration (P2P Sellers)**:
+   - **Decision**: In Phase 2, P2P sellers **must manually enter** their Post Express courier tracking reference (`PE...RS`) upon parcel dispatch.
+   - **Rationale**: Generating shipping labels (*adresnice*) under platform corporate credentials creates joint consignor liability for damaged/prohibited goods and bills returned package postage to the platform. Under *Zakon o trgovini*, keeping shipping directly between the private seller and buyer preserves the platform's classification as a non-transport classified listing service. Direct platform label generation remains strictly confined to Phase 1 Platform Owner retail inventory.
+2. **NBS IPS QR Dynamic Payload Generation**:
+   - **Decision**: IPS QR codes for seller subscriptions must be generated dynamically via the **Merchant Acquirer Payment Gateway API** (e.g., ChipCard / Banca Intesa / AllSecur) rather than offline local specification generation.
+   - **Rationale**: Acquirer-generated payloads cryptographically tie the IPS reference to the user's billing session and emit authenticated server-to-server webhooks upon real-time bank settlement, eliminating the need for fragile offline bank statement reconciliation (MT940/CAMT.053).
+3. **SMS Gateway Provider Selection**:
+   - **Decision**: **Infobip** is designated as the primary domestic SMS aggregator for OTP verification, with AWS SNS maintained as a dormant secondary failover.
+   - **Rationale**: Infobip possesses direct SS7 tier-1 peering with all three Serbian mobile network operators (Telekom Srbija/MTS, Yettel, and A1 Serbia), guaranteeing > 99.5% delivery within 10 seconds, verified registered Alphanumeric Sender ID (`KOLEKCIONAR`), and native carrier prefix validation that filters VOIP/virtual blocks at the gateway level.
 
 ---
 
@@ -568,7 +622,7 @@ The following capabilities are explicitly out of scope for v1 (Phase 1 & Phase 2
 - `[ASSUMPTION: Tier Pricing]` Starter tier is assumed at 590 RSD/month (up to 25 listings), Collector Pro at 1,490 RSD/month (up to 100 listings), and Dealer Power at 2,990 RSD/month (unlimited listings).
 - `[ASSUMPTION: Carrier Prefix Filtering]` Serbian mobile phone verification validates carrier network codes (`060`, `061`, `062`, `063`, `064`, `065`, `066`, `0677`, `068`, `069`) and rejects known VOIP/virtual ranges.
 - `[ASSUMPTION: Post Express COD Settlement]` In Phase 2, payment collection for P2P goods is settled directly at delivery via Post Express courier cash-on-delivery (*otkupnina*), which the courier deposits into the seller's bank account or pays in cash.
-- `[ASSUMPTION: AI Model Deployment]` CLIP and pHash workers run on containerized background task nodes with GPU acceleration, maintaining an average inference time under 5 seconds per image.
+- `[ASSUMPTION: AI Model Deployment]` Two-stage architecture: Stage 1 pHash and file integrity evaluation run on lightweight CPU workers (< 100ms per image), while Stage 2 quantized CLIP embeddings run on containerized background worker nodes with optional GPU or CPU-quantized ONNX acceleration, maintaining average batch inference under 10 seconds per listing without requiring expensive 24/7 dedicated GPU instances.
 
 ---
 
