@@ -1,6 +1,6 @@
-# Competition to Kolekcionar.com
+# Competition to Kolekcionar.app
 
-Web Sites that are considered competition to kolekcionar.com:
+Web Sites that are considered competition to kolekcionar.app:
 
 * [Kolekcionari.net](https://www.kolekcionari.net/) - (diecast and other collectibles, 30+ sellers)
 * [Minigaraza.com](https://minigaraza.com/) - (diecast models, one seller)

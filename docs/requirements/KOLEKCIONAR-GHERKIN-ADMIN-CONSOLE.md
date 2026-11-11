@@ -1,4 +1,4 @@
-# Kolekcionar.com Strategy
+# Kolekcionar.app Strategy
 
 ## High Level Plan
 

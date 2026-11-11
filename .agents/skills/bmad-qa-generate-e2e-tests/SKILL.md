@@ -13,7 +13,7 @@ description: 'Generate automated API and end-to-end tests for implemented featur
 
 - Bare paths (e.g. `checklist.md`) resolve from the skill root.
 - `{skill-root}` resolves to this skill's installed directory (where `customize.toml` lives).
-- `{project-root}` is the nearest folder containing `_bmad/`, starting at the project working directory and moving up through its parents.
+- `{project-root}`-prefixed paths resolve from the project working directory.
 - `{skill-name}` resolves to the skill directory's basename.
 
 ## On Activation
@@ -22,9 +22,7 @@ description: 'Generate automated API and end-to-end tests for implemented featur
 
 Run: `uv run {project-root}/_bmad/scripts/resolve_customization.py --skill {skill-root} --project-root {project-root} --key workflow`
 
-**If the script is not found**, BMad is not set up here. Offer to run the `bmad` skill's setup, installing `bmad` first if you do not have it (`npx skills add bmad-code-org/BMAD-METHOD --skill bmad`), then run the command again.
-
-**If it fails for any other reason**, resolve the `workflow` block yourself by reading these three files in base → team → user order and applying the same structural merge rules as the resolver:
+**If the script fails**, resolve the `workflow` block yourself by reading these three files in base → team → user order and applying the same structural merge rules as the resolver:
 
 1. `{skill-root}/customize.toml` — defaults
 2. `{project-root}/_bmad/custom/{skill-name}.toml` — team overrides
@@ -42,14 +40,17 @@ Treat every entry in `{workflow.persistent_facts}` as foundational context you c
 
 ### Step 4: Load Config
 
-Run: `uv run {project-root}/_bmad/scripts/resolve_config.py --project-root {project-root} --key core.project_name --key modules.bmm.implementation_artifacts`
+Run `uv run {project-root}/_bmad/scripts/resolve_config.py --project-root {project-root}` and resolve:
 
+- `project_name`, `user_name`
+- `communication_language`, `document_output_language`
+- `implementation_artifacts`
 - `date` as system-generated current datetime
-- YOU MUST ALWAYS SPEAK OUTPUT in your Agent communication style
+- YOU MUST ALWAYS SPEAK OUTPUT in your Agent communication style with the config `{communication_language}`
 
 ### Step 5: Greet the User
 
-Greet the user.
+Greet `{user_name}`, speaking in `{communication_language}`.
 
 ### Step 6: Execute Append Steps
 
@@ -166,7 +167,7 @@ If the project needs:
 
 Save summary to: `{default_output_file}`
 
-**Done!** Tests generated and verified. Validate against `checklist.md`.
+**Done!** Tests generated and verified. Validate against `./checklist.md`.
 
 ## On Complete
 

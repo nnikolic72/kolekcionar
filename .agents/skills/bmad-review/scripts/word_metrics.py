@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.10"
 # ///
 """Exact word counts for a document, as JSON.
 
@@ -62,7 +62,9 @@ def section_metrics(text: str) -> list[dict]:
         words = word_count("\n".join(section["body"]))
         if section["heading"] == "(preamble)" and words == 0:
             continue
-        out.append({"heading": section["heading"], "level": section["level"], "words": words})
+        out.append(
+            {"heading": section["heading"], "level": section["level"], "words": words}
+        )
     return out
 
 
@@ -97,8 +99,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    if sys.platform == "win32":
-        # Piped output on Windows defaults to a legacy code page, not UTF-8.
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
     sys.exit(main())
