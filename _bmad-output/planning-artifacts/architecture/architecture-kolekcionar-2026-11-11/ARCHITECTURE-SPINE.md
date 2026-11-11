@@ -28,7 +28,7 @@ companions: []
 
 ## Design Paradigm
 
-The system follows a **Modular Monolith with Asynchronous Task Workers (Pipes-and-Filters)**. The core transactional domain (Master Data Management, User Collections, Listings, Reservations, Billing & Fiscalization, Order Messaging) resides in an async FastAPI service communicating with PostgreSQL 16. Long-running, high-latency, or external tasks (Web Scraping, AI Normalization & Verification, Image Deduplication, Order Lifecycle Timers, and Fiscalization DLQ Synchronization) execute in isolated worker processes orchestrated over Redis queues via Taskiq. The client tier uses a **Universal Cross-Platform Client Architecture (Expo / React Native)** sharing code across Web, iOS, and Android, paired with a dedicated Admin Web application in a Turborepo monorepo.
+The system follows a **Modular Monolith with Asynchronous Task Workers (Pipes-and-Filters)**. The core transactional domain (Master Data Management, User Collections, Listings, Reservations, Billing & Fiscalization, Order Messaging) resides in an async FastAPI service communicating with PostgreSQL 16. Long-running, high-latency, or external tasks (Web Scraping, AI Normalization & Verification, Image Deduplication, Order Lifecycle Timers, Daily FX Rate Ingestion, and Fiscalization DLQ Synchronization) execute in isolated worker processes orchestrated over Redis queues via Taskiq. The client tier uses a **Universal Cross-Platform Client Architecture (Expo / React Native)** sharing code across Web, iOS, and Android, paired with a dedicated Admin Web application in a Turborepo monorepo.
 
 ```mermaid
 graph TD
@@ -39,7 +39,7 @@ graph TD
 
     subgraph Edge & Storage [Edge & Object Storage]
         CF_R2[Cloudflare R2 Object Storage<br/>Two-Phase Pre-signed Direct Uploads]
-        CF_CDN[Cloudflare Global Edge CDN]
+        CF_CDN[Cloudflare Global Edge CDN<br/>On-The-Fly WebP Image Resizing]
     end
 
     subgraph Railway Compute [Railway Platform Hosting]
@@ -51,7 +51,7 @@ graph TD
             WorkerML[Worker-ML: Heavy Inference Queue<br/>ONNX CLIP / pHash / Gemini Vision]
         end
         
-        DB[(Managed PostgreSQL 16<br/>pgvector + pg_trgm + JSONB)]
+        DB[(Managed PostgreSQL 16<br/>pgvector + pg_trgm + JSONB<br/>Max Connections Budgeted: 86/100)]
     end
 
     subgraph External Services
@@ -59,6 +59,7 @@ graph TD
         SMS[Infobip SMS Gateway<br/>+381 Mobile OTP Verification]
         Fiscal[Serbian Cloud e-Fiscalization Service<br/>Cloud ESIR / PFR REST API]
         NBS_IPS[NBS IPS QR & Transfer Engine<br/>Direct Payment Instructions]
+        NBS_FX[NBS Exchange Rate Daily Feed<br/>14:15 CET Banking Ingestion]
         TargetWeb[Target Wikis & APIs<br/>Hot Wheels Fandom, Pokémon, eBay]
     end
 
@@ -66,17 +67,18 @@ graph TD
     AdminApp -->|HTTPS REST| API
     App -->|1. Pre-signed PUT| CF_R2
     App -->|2. Confirm Upload| API
-    App -->|GET Images| CF_CDN
+    App -->|GET Optimized Images / Thumbnails| CF_CDN
     CF_CDN --> CF_R2
 
     API -->|Read / Write| DB
     API -->|Dispatch Jobs & Pub/Sub| Redis
     API -->|Send OTP| SMS
     API -->|Generate IPS QR / Instructions| NBS_IPS
-    API -->|Issue Fiscal Receipt| Fiscal
+    API -->|Issue Fiscal Receipt on Approval| Fiscal
 
     WorkerIO -->|Pop Jobs| Redis
     WorkerIO -->|Scrape| TargetWeb
+    WorkerIO -->|Daily Rate Ingestion| NBS_FX
     WorkerIO -->|Retry SUF Sync| Fiscal
     WorkerIO -->|Read / Write Staged Data| DB
 
@@ -107,7 +109,7 @@ graph TD
 - **Prevents:** Scraper failure crashing the API, unverified LLM hallucinations polluting the production catalog, and worker backlog collisions.
 - **Rule:** Data scraping and ingestion must traverse three sequential, decoupled Redis queues:
   1. `scraping-queue`: Scraper pool fetches raw HTML/JSON and downloads raw image assets to Cloudflare R2.
-  2. `ai-curation-queue`: Raw payloads are processed via a two-pass AI pipeline: **Pass 1 (Ingestion Agent)** parses and maps attributes to the 3-tier MDM schema; **Pass 2 (Verification Critic Agent)** validates schema consistency, detects contradictions, and scores extraction confidence.
+  2. `ai-curation-queue`: Raw payloads are processed via a two-pass AI pipeline: **Pass 1 (Ingestion Agent)** parses and maps attributes to the 3-tier MDM schema and pre-computes phonetic search aliases (AD-13); **Pass 2 (Verification Critic Agent)** validates schema consistency, detects contradictions, and scores extraction confidence.
   3. `verification-queue`: Data scoring below 95% confidence or containing unmapped attributes must be routed to the Admin Verification Queue. Direct write into production Tier 1/Tier 2 tables by automated scrapers is prohibited without human admin approval or automated pass thresholds.
 
 ```mermaid
@@ -125,7 +127,7 @@ sequenceDiagram
     Scraper->>R2: Upload raw asset images
     Scraper->>RedisQ: Enqueue payload to [ai-curation-queue]
     RedisQ->>AIWorker: Consume raw payload
-    AIWorker->>LLM: Pass 1: Extract & Normalize to 3-tier schema
+    AIWorker->>LLM: Pass 1: Extract, Normalize & Generate Phonetic Aliases
     AIWorker->>LLM: Pass 2: Critic Verification & Hallucination Check
     alt Confidence >= 95% and fully mapped
         AIWorker->>DB: Stage in pending_master_items table
@@ -136,13 +138,14 @@ sequenceDiagram
     Admin->>DB: Approve Batch -> Promote to active Tier 1 / Tier 2 catalog
 ```
 
-### AD-4 — Image Storage Zero-Egress & Two-Phase Upload Handshake [ADOPTED]
+### AD-4 — Image Storage Zero-Egress, Two-Phase Handshake & Edge Resizing [ADOPTED]
 - **Binds:** `CAP-MARKETPLACE-RESERVATION`, `CAP-SCRAPING-INGESTION`, mobile/web clients.
-- **Prevents:** Backend web container memory exhaustion during image uploads, vendor egress lock-in, unconstrained storage bomb attacks, and worker crashes on incomplete files.
-- **Rule:** All image assets (listing photos, user collection pictures, catalog reference images) must be stored in Cloudflare R2 (S3-compatible API) and served through Cloudflare CDN. The FastAPI backend must never accept multipart binary image uploads directly in production. Direct uploads must follow a strict **Two-Phase Handshake Protocol**:
+- **Prevents:** Backend web container memory exhaustion during image uploads, vendor egress lock-in, unconstrained storage bomb attacks, and mobile bandwidth choking.
+- **Rule:** All image assets (listing photos, user collection pictures, catalog reference images) must be stored in Cloudflare R2 (S3-compatible API) and served through Cloudflare CDN:
   1. **Phase 1 (Pre-sign Request)**: The client calls `POST /api/v1/photos/presign` specifying MIME type and intended usage. The API issues a short-lived (300s TTL) pre-signed S3 `PUT` URL with strict signed policy constraints: `content-length-range` enforcing maximum 10MB file size, and restricted MIME headers (`image/jpeg`, `image/png`, `image/webp`).
   2. **Client Direct Upload**: The client streams the image directly from device memory/disk to Cloudflare R2.
   3. **Phase 2 (Confirmation Handshake)**: Upon successful upload, the client calls `POST /api/v1/photos/confirm` with the assigned image UUID. The FastAPI backend executes a lightweight `HeadObject` check against R2 verifying exact object presence, Content-Type, and size before persisting the database record and enqueuing the asset to the `ai-curation-queue` or `anti-fraud-queue`. Images must be referenced exclusively by their UUID-keyed object paths.
+  4. **Cloudflare Edge Image Resizing**: All client-facing image URLs (thumbnails, detail views, responsive variants) must be served through Cloudflare CDN Edge Image Resizing (`https://assets.kolekcionar.app/cdn-cgi/image/width={width},format=webp,quality=80/{image_uuid}.webp`). Worker processes must never perform synchronous thumbnail downscaling, and no thumbnail duplicates are stored in R2.
 
 ### AD-5 — Atomic Marketplace Multi-Quantity Reservation & Lifecycle Maintenance [ADOPTED]
 - **Binds:** `CAP-MARKETPLACE-RESERVATION`, listings, orders.
@@ -223,12 +226,12 @@ graph LR
 - **Prevents:** Illegal commission-taking under Serbian Commerce Law (*Zakon o trgovini*) and premature privacy leaks between traders.
 - **Rule:** In Phase 2, the platform operates strictly as a classified listing facilitator funded by recurring seller subscription fees (`Starter`, `Collector Pro`, `Dealer Power`); the platform must NEVER take transaction commissions or hold escrow funds. In the order workflow, buyer full name, phone number, and delivery address must remain masked until the seller clicks "Confirm Order". Once confirmed, shipping details are revealed solely for direct courier cash-on-delivery (*pouzećem*) fulfillment.
 
-### AD-9 — Cloud e-Fiscalization & NBS IPS Direct Payments [ADOPTED]
+### AD-9 — Cloud e-Fiscalization & NBS IPS Direct Reconciliation [ADOPTED]
 - **Binds:** `CAP-BILLING-FISCALIZATION`, subscriptions, retail checkout.
 - **Prevents:** Statutory non-compliance with the Serbian *Zakon o fiskalizaciji*, illegal untracked revenue, and unnecessary merchant acquiring banking overhead prior to product-market fit.
 - **Rule:** The platform adopts **Option A: Cloud ESIR / PFR REST API** (e.g. Teron, Sky e-fiskalizacija, or Moj e-Račun) for all statutory fiscal invoice generation:
   1. **Phase 1 Retail Fiscalization**: In Phase 1, platform owner retail sales dispatched via courier cash-on-delivery (*pouzećem*) generate fiscal receipts via the Cloud PFR API upon parcel dispatch.
-  2. **Phase 2 Seller Subscriptions (NBS IPS Direct)**: Card payment processing (ChipCard/NestPay) is deferred. Phase 2 monthly seller subscriptions are paid via direct bank transfer and NBS IPS QR code (`K:PR|V:01|...`) directly to the platform owner's account. Upon payment verification, the system issues a statutory fiscal receipt via the Cloud PFR API and unlocks the seller quota.
+  2. **Phase 2 Seller Subscriptions (NBS IPS Direct & Reconciliation)**: Card payment processing (ChipCard/NestPay) is deferred. Phase 2 monthly seller subscriptions are initiated by generating an NBS IPS QR code (`K:PR|V:01|...`) and payment slip instructions carrying a deterministic payment reference: `KOLEK-<USER_ID>-<MONTH>`. Subscriptions enter status `PendingPaymentVerification`. The platform administrator reconciles received bank transfers via the Admin Console (`/admin/fiscal`), where single-click approval calls the Cloud PFR API to issue the statutory fiscal receipt, emails the PDF to the seller, and unlocks the listing tier quota.
   3. **Offline Resilience & DLQ**: If the Cloud PFR service or Ministry of Finance SUF portal times out (> 3.0s) or returns HTTP 5xx, the transaction capture is not aborted. The system creates a pending fiscal record, enqueues the payload to `fiscal-sync-queue` (Taskiq), and retries synchronization with exponential backoff within the statutory 5-day window.
 
 ### AD-10 — Real-Time Order Messaging & Phased Disclosure Gateway [ADOPTED]
@@ -246,6 +249,41 @@ graph LR
   - **Phase 1 (`P2P_MARKETPLACE_ENABLED=false`)**: The platform operates strictly as the Platform Owner Retail Showcase and Collector Portfolio Tracker. Only Admin accounts can create public listings; standard users have read-only access to the catalog, 100% free lifetime personal collection portfolio tracking, and Berze event viewing. Phase 1 retail fulfillment operates exclusively via courier delivery (Post Express or other couriers) with Cash-on-Delivery (*pouzećem*). Domestic card processing is postponed until the platform reaches sufficient scale.
   - **Phase 2 (`P2P_MARKETPLACE_ENABLED=true`)**: Full P2P multi-seller classified reservation system unlocks. Subscribed sellers create listings, AI fraud detection activates, atomic reservations open to SMS-verified users, and direct COD fulfillment executes under *Zakon o trgovini*.
 
+### AD-12 — Local Relational NBS FX Cache & Deterministic Lookback [ADOPTED]
+- **Binds:** `CAP-PORTFOLIO-TRACKER`, `modules/collection`.
+- **Prevents:** Runtime HTTP latency spikes, crashes during National Bank of Serbia network outages, and missing weekend rates.
+- **Rule:** The platform must maintain a dedicated PostgreSQL table `exchange_rates(currency VARCHAR(3), rate_date DATE, middle_rate NUMERIC(12, 4), created_at TIMESTAMPTZ, PRIMARY KEY (currency, rate_date))` pre-seeded with historical NBS middle exchange rates for EUR and USD from 2000 to the present.
+  1. **Scheduled Daily Ingestion**: A scheduled Taskiq cron executes every banking business day at 14:15 CET (immediately following official NBS publication) to insert the day's official rates.
+  2. **Pure Local Resolution**: At runtime, `modules/collection` resolves historical conversion costs exclusively via local SQL:
+     ```sql
+     SELECT middle_rate, rate_date 
+     FROM exchange_rates 
+     WHERE currency = :currency AND rate_date <= :acquisition_date 
+     ORDER BY rate_date DESC 
+     LIMIT 1;
+     ```
+  Synchronous outbound HTTP calls to external NBS endpoints during user item creation are strictly prohibited. The SQL `<=` condition deterministically guarantees statutory Friday rate fallback for acquisitions occurring on weekends or public non-banking holidays without branching logic.
+
+### AD-13 — Cross-Script Phonetic Search & Ingestion Alias Pre-computation [ADOPTED]
+- **Binds:** `CAP-MDM-CATALOG`, search service, `modules/mdm`.
+- **Prevents:** Search misses when collectors query English collectible names using Serbian Cyrillic phonetics (e.g. `Нисан Скајлајн` vs `Nissan Skyline`).
+- **Rule:** During the Two-Pass AI Ingestion Pipeline (AD-3), Pass 1 must generate localized phonetic search aliases for every Tier 1 Master Item:
+  1. Serbian Cyrillic phonetic transcription (e.g. `Нисан Скајлајн`).
+  2. Serbian Latin phonetic transcription (e.g. `Nisan Skajlajn`).
+  3. Popular casting or character community nicknames (e.g. `Godzilla`, `R34`).
+  
+  These aliases are persisted in a `search_aliases TEXT[]` array column on `master_items`, indexed with a PostgreSQL GIN trigram index (`CREATE INDEX idx_master_items_search ON master_items USING gin (name gin_trgm_ops, search_aliases)`). At query time, the search service normalizes incoming Cyrillic queries to Latin, and evaluates trigram similarity simultaneously against both canonical English names and pre-computed aliases.
+
+### AD-14 — Bounded Database Connection Pool & Railway Budgeting [ADOPTED]
+- **Binds:** `all` backend processes, Railway deployment.
+- **Prevents:** PostgreSQL client connection exhaustion (`too many clients already`) exceeding Railway's standard 100-connection container ceiling.
+- **Rule:** Total database connection pools across all Railway container instances must be strictly budgeted in `core/config.py`:
+  - `kolekcionar-api` (4 Uvicorn workers): `pool_size = 5, max_overflow = 5` per worker process (Max 40 connections).
+  - `kolekcionar-worker-io` (up to 8 processes): `pool_size = 2, max_overflow = 2` per process (Max 32 connections).
+  - `kolekcionar-worker-ml` (2 processes): `pool_size = 2, max_overflow = 0` (Max 4 connections).
+  - Next.js Admin & migrations: Max 10 connections.
+  The theoretical maximum concurrent connection footprint is capped at 86, preserving a 14-connection safety margin below Railway's 100-connection ceiling without requiring PgBouncer in early phases.
+
 ## Consistency Conventions
 
 | Concern | Convention |
@@ -259,8 +297,12 @@ graph LR
 | Authentication | Bearer JWT (Access Token 15m, Refresh Token 30d in httpOnly cookie / SecureStore) |
 | Real-Time Messaging | WebSocket RFC 6455 authenticated via single-use ticket; Redis Pub/Sub broadcast |
 | Image Upload Limits | Max 10MB per image, MIME types: `image/jpeg`, `image/png`, `image/webp`; two-phase presign + confirm handshake |
+| Image Transformations | Cloudflare CDN Edge Resizing: `/cdn-cgi/image/width={w},format=webp,quality=80/{id}.webp` |
 | Fraud Thresholds | Configurable: pHash Hamming distance `<= 5`, CLIP cosine similarity `> 0.92`, risk threshold `0.70` |
 | Fiscalization DLQ | Exponential backoff retry (1m, 5m, 30m, 2h, 12h), maximum 5 days statutory limit |
+| FX Rate Resolution | Local relational table `exchange_rates` with deterministic `<=` lookback query (zero runtime HTTP calls) |
+| Search Aliases | `search_aliases TEXT[]` with GIN trigram index covering Cyrillic and Latin phonetic variations |
+| Database Connections | Hard-capped per service tier (`api` = 5+5, `worker-io` = 2+2, `worker-ml` = 2+0; peak = 86/100) |
 | Configuration | 12-factor environment variables validated through `pydantic-settings` |
 | Logging | Structured JSON logging with `trace_id`, `user_id`, and `duration_ms` |
 
@@ -284,6 +326,7 @@ graph LR
 | Next.js | 15.x | Admin Console web framework |
 | Turborepo | 2.x | Monorepo build and workspace orchestrator |
 | Cloudflare R2 | S3 API | Zero-egress object storage for photos |
+| Cloudflare Images | CDN Edge | On-the-fly WebP image resizing and responsive delivery |
 | ONNX Runtime | 1.20.x | Lightweight CPU inference for CLIP ViT-B/32 (Worker-ML) |
 | ImageHash | 4.3.x | Perceptual hashing (pHash) library |
 | Infobip API | REST v1 | Regional SMS OTP gateway for Serbian mobile numbers (+381) |
@@ -304,25 +347,26 @@ graph TD
 
     subgraph Railway Project
         WebGateway[FastAPI Web & WebSocket Service<br/>Port 8000]
-        WorkerIO[Taskiq Worker-IO<br/>Concurrency 4-8: Scrapers, SMS, Fiscal DLQ, Lifecycle Crons]
+        WorkerIO[Taskiq Worker-IO<br/>Concurrency 4-8: Scrapers, SMS, Fiscal DLQ, FX Sync, Lifecycle Crons]
         WorkerML[Taskiq Worker-ML<br/>Concurrency 2: ONNX CLIP & Vision]
-        TaskiqScheduler[Taskiq Scheduler<br/>7-Day TTLs, 14-Day Delivery Auto-Complete]
-        PG[(PostgreSQL 16 Service<br/>pgvector + pg_trgm)]
+        TaskiqScheduler[Taskiq Scheduler<br/>7-Day TTLs, 14-Day Delivery Auto-Complete, 14:15 FX Ingestion]
+        PG[(PostgreSQL 16 Service<br/>pgvector + pg_trgm<br/>Max Connections: 86)]
         RedisInstance[(Redis Service<br/>Broker & Pub/Sub Backend)]
     end
 
     subgraph External Infrastructure
         R2[Cloudflare R2 Bucket<br/>assets.kolekcionar.app]
-        CFEdge[Cloudflare CDN]
+        CFEdge[Cloudflare CDN<br/>Edge Image Resizing]
         Infobip[Infobip SMS Gateway]
         Gemini[Google Gemini 1.5 Flash Vision API]
         FiscalCloud[Serbian Cloud PFR / ESIR Service]
+        NBSGov[National Bank of Serbia<br/>Daily FX Portal]
     end
 
     ClientApp --> WebGateway
     AdminApp --> WebGateway
     ClientApp -.->|Direct Upload| R2
-    ClientApp -->|Read Images| CFEdge
+    ClientApp -->|Read Images & Thumbnails| CFEdge
     CFEdge --> R2
 
     WebGateway --> PG
@@ -334,6 +378,7 @@ graph TD
     WorkerIO --> PG
     WorkerIO --> R2
     WorkerIO --> FiscalCloud
+    WorkerIO --> NBSGov
     TaskiqScheduler --> RedisInstance
 
     WorkerML --> RedisInstance
@@ -364,15 +409,15 @@ kolekcionar/
 │       │   │   ├── mdm/                    # 3-tier catalog CRUD & staging approval
 │       │   │   ├── scrapers/               # Scraper pool trigger & monitoring
 │       │   │   ├── fraud/                  # Flagged image & counterfeit review
-│       │   │   ├── fiscal/                 # e-Fiscal audit trail & SUF DLQ monitor
+│       │   │   ├── fiscal/                 # e-Fiscal audit trail, NBS IPS reconciliation & SUF DLQ
 │       │   │   └── disputes/               # Dispute arbitration & feedback redactor
 │       │   └── components/                 # Data tables & diff inspectors
 │       └── package.json
 ├── backend/                                # FastAPI Python Application (Domain-First)
 │   ├── app/
 │   │   ├── core/                           # Cross-cutting concerns
-│   │   │   ├── config.py                   # Pydantic v2 settings (fraud thresholds, envs)
-│   │   │   ├── database.py                 # Async SQLAlchemy engine & AsyncSession
+│   │   │   ├── config.py                   # Pydantic v2 settings (fraud thresholds, pool budgets)
+│   │   │   ├── database.py                 # Async SQLAlchemy engine with budgeted connection pool
 │   │   │   ├── security.py                 # JWT, bcrypt password hashing, phone OTP
 │   │   │   ├── storage_r2.py               # Cloudflare R2 S3 pre-signed URL generator
 │   │   │   └── websockets.py               # Redis Pub/Sub WebSocket connection manager
@@ -382,16 +427,16 @@ kolekcionar/
 │   │   │   │   ├── models.py
 │   │   │   │   ├── schemas.py
 │   │   │   │   └── service.py
-│   │   │   ├── mdm/                        # 3-tier Catalog (MasterItem, Variant) & Search
+│   │   │   ├── mdm/                        # 3-tier Catalog (MasterItem, Variant) & Search Aliases
 │   │   │   │   ├── router.py
-│   │   │   │   ├── models.py
+│   │   │   │   ├── models.py               # Includes search_aliases TEXT[]
 │   │   │   │   ├── schemas.py
-│   │   │   │   └── service.py
-│   │   │   ├── collection/                 # Tier 3 User Lots, Portfolio, NBS FX pegging
+│   │   │   │   └── service.py              # Cross-script Cyrillic/Latin search engine
+│   │   │   ├── collection/                 # Tier 3 User Lots, Portfolio, Local NBS FX cache
 │   │   │   │   ├── router.py
-│   │   │   │   ├── models.py
+│   │   │   │   ├── models.py               # UserLot, ExchangeRate (AD-12)
 │   │   │   │   ├── schemas.py
-│   │   │   │   └── service.py
+│   │   │   │   └── service.py              # Deterministic NBS FX lookback calculator
 │   │   │   ├── marketplace/                # Listings, Atomic Reservations, Orders, COD
 │   │   │   │   ├── router.py
 │   │   │   │   ├── models.py
@@ -399,7 +444,7 @@ kolekcionar/
 │   │   │   │   └── service.py
 │   │   │   ├── billing/                    # Subscriptions, NBS IPS QR generator, Cloud e-Fiscalization
 │   │   │   │   ├── router.py
-│   │   │   │   ├── models.py
+│   │   │   │   ├── models.py               # Subscription with PendingPaymentVerification state
 │   │   │   │   ├── schemas.py
 │   │   │   │   └── fiscal_service.py       # Cloud PFR REST client + DLQ dispatcher
 │   │   │   ├── messaging/                  # Order chat WebSocket & Phased PII disclosure
@@ -416,10 +461,11 @@ kolekcionar/
 │   │   │   ├── broker.py                   # Redis broker initialization
 │   │   │   ├── scrapers/                   # Wiki & eBay crawlers
 │   │   │   ├── ml_inference/               # ONNX CLIP ViT-B/32 & pHash singleton worker
-│   │   │   ├── ai_curation/                # Gemini Flash 2-pass ingestion & critic
+│   │   │   ├── ai_curation/                # Gemini Flash 2-pass ingestion & phonetic aliases
 │   │   │   ├── fiscal_sync/                # Statutory 5-day SUF retry sync worker
 │   │   │   └── maintenance/                # Scheduled crons
 │   │   │       ├── ttl_cleanup.py          # 7-day reservation expiration & stock restore
+│   │   │       ├── fx_sync.py              # Daily 14:15 CET official NBS rate ingestion
 │   │   │       └── order_autocommit.py     # 14-day InTransit delivery auto-completion guard
 │   │   └── main.py                         # ASGI application entrypoint
 │   ├── alembic/                            # Database migration scripts
@@ -438,13 +484,13 @@ kolekcionar/
 
 | Capability / Area | Lives in | Governed by |
 | --- | --- | --- |
-| CAP-MDM-CATALOG | `backend/app/modules/mdm`, `apps/admin/src/app/mdm` | AD-1, AD-2 |
-| CAP-PORTFOLIO-TRACKER | `backend/app/modules/collection`, `apps/app/app/(tabs)/portfolio` | AD-1, AD-2 |
+| CAP-MDM-CATALOG | `backend/app/modules/mdm`, `apps/admin/src/app/mdm` | AD-1, AD-2, AD-13 |
+| CAP-PORTFOLIO-TRACKER | `backend/app/modules/collection`, `apps/app/app/(tabs)/portfolio` | AD-1, AD-2, AD-12 |
 | CAP-MARKETPLACE-RESERVATION | `backend/app/modules/marketplace`, `apps/app/app/listing` | AD-4, AD-5, AD-8, AD-11 |
 | CAP-BILLING-FISCALIZATION | `backend/app/modules/billing`, `backend/app/workers/fiscal_sync` | AD-9, AD-11 |
 | CAP-ORDER-MESSAGING | `backend/app/modules/messaging`, `apps/app/app/order/[id]/chat` | AD-8, AD-10 |
 | CAP-SCRAPING-INGESTION | `backend/app/workers/scrapers`, `apps/admin/src/app/scrapers` | AD-3, AD-4 |
-| CAP-AI-CURATION-FRAUD | `backend/app/workers/ml_inference`, `backend/app/workers/ai_curation` | AD-3, AD-7 |
+| CAP-AI-CURATION-FRAUD | `backend/app/workers/ml_inference`, `backend/app/workers/ai_curation` | AD-3, AD-7, AD-13 |
 | CAP-COMMUNITY-BERZE | `backend/app/modules/berze`, `apps/app/app/(tabs)/berze` | AD-1 |
 | Universal Client Runtime | `apps/app`, `packages/api-client` | AD-6 |
 
@@ -456,20 +502,24 @@ The production environment on Railway consists of isolated internal services com
    - Containerized FastAPI ASGI server running under `uvicorn` with 4 worker processes.
    - Publicly routed via custom domain `api.kolekcionar.app` with automated SSL.
    - Serves REST API endpoints and terminates WebSocket connections for real-time order chat.
+   - Budgeted database connection pool: `pool_size = 5, max_overflow = 5` per Uvicorn process (Max 40 connections).
    - Connected to internal PostgreSQL and Redis via private internal DNS.
 
 2. **`kolekcionar-worker-io` Lightweight Taskiq Worker Service**:
-   - Concurrency 4–8. Handles I/O-bound tasks: web scrapers, Infobip SMS dispatch, SUF fiscalization retry sync, and order lifecycle maintenance crons.
+   - Concurrency 4–8. Handles I/O-bound tasks: web scrapers, Infobip SMS dispatch, SUF fiscalization retry sync, daily NBS rate sync at 14:15 CET, and order lifecycle maintenance crons.
+   - Budgeted connection pool: `pool_size = 2, max_overflow = 2` per worker process (Max 32 connections).
    - Low memory footprint (< 300MB RAM).
 
 3. **`kolekcionar-worker-ml` Heavy Taskiq Inference Worker Service**:
    - Concurrency strictly pinned to 2 processes.
    - Dedicated memory limit: 1.5GB RAM.
+   - Budgeted connection pool: `pool_size = 2, max_overflow = 0` (Max 4 connections).
    - Loads the ONNX Runtime session for `CLIP ViT-B/32` as a process-level singleton with `intra_op_num_threads=2`. Executes CPU perceptual hashing (pHash) and visual embeddings without starving API response threads.
 
 4. **`kolekcionar-db` Managed PostgreSQL 16 Service**:
    - Automated daily backups, volume snapshots.
    - Initialized with `CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`, `CREATE EXTENSION IF NOT EXISTS "vector";`, and `CREATE EXTENSION IF NOT EXISTS "pg_trgm";`.
+   - Hard connection limit: 100 connections. Managed total connection peak capped at **86 connections** (AD-14).
 
 5. **`kolekcionar-redis` Managed Redis Service**:
    - In-memory key-value store with AOF persistence.
